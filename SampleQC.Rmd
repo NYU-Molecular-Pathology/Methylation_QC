@@ -1,0 +1,420 @@
+---
+title: "SampleQC"
+author: "Varshini"
+output:
+  html_document:
+    css: styles.css
+    keep_md: yes
+    number_sections: true
+    toc: true
+    toc_float: true
+---
+
+<!-- Setup the R code to be used in R Markdown generation throughout the report -->
+```{r setup, include=FALSE} 
+# {.tabset} # .tabset-fade .tabset-pills
+
+# ~~~~~ SETTINGS ~~~~~ #
+knitr::opts_chunk$set(echo = FALSE)
+
+# ~~~~~ LOAD PACKAGES ~~~~~ #
+library("knitr")
+library("ggplot2")
+library("reshape2")
+library("data.table")
+library("DT")
+library("plotly")
+library("MethylAid")
+source("replaceZeros.R")
+source("util.R")
+library("minfi")
+library("scales")
+library("IlluminaHumanMethylationEPICmanifest")
+library("IlluminaHumanMethylationEPICanno.ilm10b2.hg19")
+library("IlluminaHumanMethylation450kmanifest")
+library("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+library("Biobase")
+library("RColorBrewer")
+library("limma")
+library("ggfortify")
+library("Rtsne")
+library("qdapTools")
+library("gplots")
+```
+
+```{r, Testing QC report - basic summarization of data and other required functions,warning=FALSE,message=FALSE,echo=FALSE,include=FALSE}
+
+baseDir <- "/Users/Documents/Methylation_QC/idats"
+outDir <- getwd()
+targets <- read.metharray.sheet(baseDir,pattern = "SampleSheet.csv")
+targets$Basename <- gsub('c\\("', '', targets$Basename)
+
+##Need to combine arrays for QC##
+targets_450k <- subset(targets,targets$Array_Type == "450K")
+targets_850k <- subset(targets,targets$Array_Type == "850K")
+  
+RGSet_450k <- read.metharray.exp(targets=targets_450k,force = TRUE)
+RGSet_850k <- read.metharray.exp(targets=targets_850k,force = TRUE)
+
+RGSet <- combineArrays(RGSet_450k,RGSet_850k,outType = "IlluminaHumanMethylation450k")
+
+##Editing source code to get final RGSet##
+summarizeControls <- function(RGSet)  {
+    
+    ##control probe information
+    TypeControl <- getProbeInfo(RGSet, type = "Control")
+    TypeControl <- as.data.frame(TypeControl)
+    colnames(TypeControl)
+    
+    R <- getRed(RGSet)
+    G <- getGreen(RGSet)
+
+    ##maybe notify when controls are not on the array
+    id <- intersect(TypeControl$Address, rownames(R))
+    R <- R[rownames(R) %in% id,]
+    G <- G[rownames(G) %in% id,]
+    TypeControl <- TypeControl[TypeControl$Address %in% id,]
+    TypeControl <- TypeControl[order(TypeControl$Address), ]
+
+    list(TypeControl=TypeControl, R=R, G=G)
+}
+
+summarizeMUvalues <- function(RGSet)
+    {
+        MU <- matrix(0.0, nrow=2, ncol=ncol(RGSet))
+        MUset <- preprocessRaw(RGSet)
+        M <- getMeth(MUset)
+        MU[1,] <- colMedians(M, na.rm=TRUE)
+        U <- getUnmeth(MUset)
+        MU[2,] <- colMedians(U, na.rm=TRUE)
+        colnames(MU) <- colnames(RGSet)
+        rownames(MU) <- c("Methylated", "Unmethylated")
+        MU
+    }
+ 
+prepareData <- function(object)
+  {
+    ##TODO add logarithm as plot option
+    R <- log2(object@Rcontrols)
+    G <- log2(object@Gcontrols)
+
+    controls <- object@controls[!(object@controls$Type %in%
+                                        c("NORM_A", "NORM_G", "NORM_C", "NORM_T")), ] ##not used yet!
+
+    data <- data.frame(Address=rep(rownames(R), ncol(R)),
+                       Samples=rep(colnames(R), each=nrow(R)),
+                       IntRed=as.vector(R),
+                       IntGrn=as.vector(G))
+
+    merge(controls, data)
+}
+
+    ##calculate detection p-value and frequency of probe passing threshold
+    DP <- detectionP(RGSet, na.rm=TRUE)
+    DPfreq <- colSums(DP < 0.01, na.rm=TRUE)/nrow(DP)
+
+    ##summarize R and G channels control probes
+    RG <- summarizeControls(RGSet)
+
+    ##summarize M and U values
+    MU <- summarizeMUvalues(RGSet)
+
+    ##convert all columns to factors this is convenient for plotting
+    if(nrow(targets) > 1)
+        targets <- data.frame(apply(targets, 2, function(x)
+            factor(as.character(x))),
+                              row.names=row.names(targets))
+
+    ##add row names
+    rownames(targets) <- colnames(MU)
+
+    sdata <- new("summarizedData",
+                 targets=targets,
+                 controls=RG$TypeControl,
+                 Rcontrols=as.matrix(RG$R),
+                 Gcontrols=as.matrix(RG$G),
+                 DPfreq=DPfreq,
+                 MU=MU)
+    sdata@plotdata <- prepareData(sdata)
+    
+     ##Run the general QC code##
+    
+    qcProbes=list(
+  BSI="^BISULFITE CONVERSION I$",
+  BSII="^BISULFITE CONVERSION II$",
+  EC="^EXTENSION$",
+  SPI="^SPECIFICITY I$",
+  HYB= "^HYBRIDIZATION$",
+  NP="^NON-POLYMORPHIC$",
+  SPII="^SPECIFICITY II$",
+  TR="^TARGET REMOVAL$",
+  SC="^STAINING$",
+  NC="^NEGATIVE$")
+
+##MU##
+rotateData <- function(data, columns) {
+  data[,columns] <- c(0.5*(data[,columns[1]] + data[,columns[2]]),
+                      data[,columns[1]] - data[,columns[2]])
+  data
+}
+
+MU <- log2(t(sdata@MU))
+targets <- sdata@targets
+data_MU <- merge(MU, targets, by="row.names")
+data_rotated <- rotateData(data_MU, columns=c("Methylated", "Unmethylated"))
+data_rotated_final <- subset(data_rotated,data_rotated$Methylated > 9)
+outlier_MU <- subset(data_rotated, data_rotated$Methylated <= 9 )
+plotMU <- ggplot(data_rotated_final,aes(x=Methylated,y=Unmethylated,color=Sample_Group,text = Sample_Name))+geom_point(shape=19,size=4,alpha = 0.6)+geom_vline(xintercept = 9,linetype='dashed',colour = "red")+geom_point(data=outlier_MU,shape=8,size=4)+theme_bw()+theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid",colour ="darkblue"),panel.grid.major = element_blank(),panel.grid.minor = element_blank())+xlab("log2 sqrt(M*U)")+ylab("log2 (M/U)")+guides(colour = guide_legend(override.aes = list(shape = 19)))
+
+
+##Plot OP overall qc##
+data_OP <- sdata@plotdata
+d <- data_OP[grepl(qcProbes["NP"], data_OP$Type),]
+dGrn <- d[d$ExtendedType %in% c("NP (C)", "NP (G)"), c(1:5,7)]        
+x <- tapply(dGrn$IntGrn, dGrn$Samples, mean)
+is.na(x) <- !is.finite(x)
+dRed <- d[d$ExtendedType %in% c("NP (A)", "NP (T)"), c(1:6)]    
+y <- tapply(dRed$IntRed, dRed$Samples, mean)
+is.na(y) <- !is.finite(y)
+data_OP <- data.frame(x, y)
+targets <- sdata@targets
+data_final_OP <- merge(data_OP, targets, by="row.names", suffixes=c("", ".y")) ##as we expect x and y
+data_OP_plot <- rotateData(data_final_OP, columns=c("x", "y"))
+data_OP_plot_final <-  subset(data_OP_plot,data_OP_plot$x > 11)
+outlier_OP <- subset(data_OP_plot, data_OP_plot$x <= 11)
+
+plotOP <- ggplot(data_OP_plot_final,aes(x=x,y=y,color=Sample_Group,text = Sample_Name))+geom_point(shape=19,size=4,alpha=0.6)+geom_vline(xintercept = 11,linetype='dashed',colour = "red")+geom_point(data=outlier_OP,shape=8,size=4)+theme_bw()+theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid",colour ="darkblue"),panel.grid.major = element_blank(),panel.grid.minor = element_blank())+xlab("log2 sqrt(R*G)")+ylab("log2 (R/G)")+guides(colour = guide_legend(override.aes = list(shape = 19)))
+    
+    
+##Plot BS##
+data_BS <- sdata@plotdata
+d <- data_BS[grepl(qcProbes["BSI"], data_BS$Type),]
+dGrn <- d[grepl("C1|C2|C3", d$ExtendedType), c(1:5,7)]
+x <- tapply(dGrn$IntGrn, dGrn$Samples, mean)
+dRed <- d[grepl("C4|C5|C6", d$ExtendedType), c(1:6)]  ##EPIC is missing I-C6 Bisulfite control probe and corresponding I-U6
+y <- tapply(dRed$IntRed, dRed$Samples, mean)
+data_BS <- data.frame(x, y)
+targets <- sdata@targets
+data_final_BS <- merge(data_BS, targets, by="row.names", suffixes=c("", ".y")) ##as we expect x and y
+data_BS_plot <- rotateData(data_final_BS, columns=c("x", "y"))
+data_BS_plot_final <- subset(data_BS_plot, data_BS_plot$x > 10 )
+outlier_BS <- subset(data_BS_plot, data_BS_plot$x <= 10 )
+
+plotBS <- ggplot(data_BS_plot_final,aes(x=x,y=y,color=Sample_Group, text = Sample_Name))+geom_point(shape=19,size=4,alpha =0.6)+geom_vline(xintercept = 10,linetype='dashed',colour = "red")+geom_point(data=outlier_BS,shape=8,size=4)+theme_bw()+theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid",colour ="darkblue"),panel.grid.major = element_blank(),panel.grid.minor = element_blank())+xlab("log2 sqrt(R*G)")+ylab("log2 (R/G)")+guides(colour = guide_legend(override.aes = list(shape = 19)))
+
+##Plot HC##
+data_HC <- sdata@plotdata
+d <- data_HC[grepl(qcProbes["HYB"], data_HC$Type),]
+d <- d[order(d$Samples),]
+x <- 0.5*(d$IntGrn[grepl("High", d$ExtendedType)] + d$IntGrn[grepl("Low", d$ExtendedType)])
+y <- d$IntGrn[grepl("High", d$ExtendedType)] - d$IntGrn[grepl("Low", d$ExtendedType)]
+
+data_HC <- data.frame(x, y, row.names=d$Samples[grepl("High", d$ExtendedType)])
+targets <- sdata@targets
+data_final_HC <- merge(data_HC, targets, by="row.names", suffixes=c("", ".y")) ##as we expect x and y
+data_HC_finalplot <- subset(data_final_HC, data_final_HC$x > 12.75 )
+outlier_HC <- subset(data_final_HC, data_final_HC$x <= 12.75 )
+
+plotHC <- ggplot(data_HC_finalplot,aes(x=x,y=y,color=Sample_Group,text=Sample_Name))+geom_point(shape=19,size=4,alpha=0.6)+geom_vline(xintercept = 12.75,linetype='dashed',colour = "red")+geom_point(data=outlier_HC,shape=8,size=4)+theme_bw()+theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid",colour ="darkblue"),panel.grid.major = element_blank(),panel.grid.minor = element_blank())+xlab("log2 sqrt(H*L)")+ylab("log2 (H/L)")+guides(colour = guide_legend(override.aes = list(shape = 19)))
+
+
+##Plot DP##
+y <- sdata@DPfreq
+x <- 1:length(y)
+data_DP <- data.frame(x, y, row.names=names(y))
+targets <- sdata@targets
+data_final_DP <- merge(data_DP, targets, by="row.names", suffixes=c("", ".y")) ##as we expect x and y
+data_DP_finalplot <- subset(data_final_DP, data_final_DP$y > 0.95)
+outlier_DP <- subset(data_final_DP, data_final_DP$y <= 0.95)
+
+plotDP <- ggplot(data_DP_finalplot,aes(x=x,y=y,color=Sample_Group,text = Sample_Name))+geom_point(shape=19,size=4,alpha=0.6)+geom_hline(yintercept = 0.95,linetype='dashed',colour = "red")+geom_point(data=outlier_DP,shape=8,size=4)+theme_bw()+theme(legend.background = element_rect(fill="lightblue",size=0.5, linetype="solid",colour ="darkblue"),panel.grid.major = element_blank(),panel.grid.minor = element_blank())+xlab("Samples")+ylab("Pvalue")+guides(colour = guide_legend(override.aes = list(shape = 19)))+scale_x_continuous(breaks= pretty_breaks())
+
+######################### TSNE and Heatmaps minfi processing ########################
+phenoData <- pData(RGSet)
+manifest <- getManifest(RGSet)
+
+mSetSq <- preprocessQuantile(RGSet)
+gset.funnorm <- mSetSq
+dim(gset.funnorm)
+
+###Normalisation###
+gset.funnorm <- addSnpInfo(gset.funnorm) ##add the genomic ranges info to gset
+gset.funnorm <- dropLociWithSnps(gset.funnorm,snps=c("SBE", "CpG"), maf=0) ##drop the loci which has snps
+
+###Get annotation###
+annot = getAnnotation(gset.funnorm)
+
+###Get beta values to obtain the data matrix###
+gset.funnorm.beta <- getBeta(gset.funnorm)
+gset.funnorm.beta_df <- as.data.frame(gset.funnorm.beta)
+colnames(gset.funnorm.beta_df) <- gset.funnorm$Sample_Name
+
+##For heatmaps and tsne##
+colnames(gset.funnorm.beta) <- gset.funnorm$Sample_Group
+condition <- pData(gset.funnorm)$Sample_Group
+dmp <- dmpFinder(gset.funnorm.beta, pheno=condition, type="categorical")
+dmp <- cbind(dmp, ID=rownames(dmp))
+dmp_annot_combined <- cbind(annot[row.names(dmp),],dmp)
+
+final_samples <- row.names((t(gset.funnorm.beta_df[row.names(dmp[1:10000,]),])))
+gset.funnorm.beta_df <- gset.funnorm.beta_df[,colnames(gset.funnorm.beta_df) %in% final_samples]
+######### TSNE ############
+tsne <- Rtsne(t(gset.funnorm.beta_df[row.names(dmp[1:10000,]),]), dims = 3, perplexity=2, verbose=TRUE, max_iter = 500)
+targets_plot <- targets[targets$Sample_Name %in% colnames(gset.funnorm.beta_df),]
+tsne_plot <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2], z= tsne$Y[,3], samples = targets_plot$Sample_Name, GROUPS = targets_plot$Sample_Group)
+
+##2d with shapes##
+p2d_groups <- plot_ly(data = tsne_plot, x = tsne_plot$x, y=tsne_plot$y, color = tsne_plot$GROUPS,symbol=~source,symbols = c('circle','cross'),type = "scatter", mode = "markers",text = ~paste('Sample:',samples, '</br> Classifier Group:',GROUPS),marker = list(size = 8,line = list(width = 1),outlinecolor = "black"),colors = c("red","orange","cyan4","lightgreen","darkgreen","blue","pink","grey","coral3","darkorchid2","lightsalmon1","mediumpurple4","olivedrab","slateblue","tomato2","burlywood4"),opacity = 0.9) %>% layout(xaxis = list(title="TSNE1",zeroline = FALSE,showgrid =FALSE,showline = TRUE), yaxis = list(title="TSNE2",zeroline = FALSE,showgrid =FALSE,showline = TRUE), margin = list(l = 50, r = 50, b = 50, t = 50, pad = 4))
+
+##3d with shapes##
+p3d_groups <-plot_ly(data = tsne_plot, x = tsne_plot$x, y = tsne_plot$y, z = tsne_plot$z, symbol =~source,symbols = c('circle','cross'),color = tsne_plot$GROUPS,type="scatter3d",mode="markers",colors = c("red","orange","cyan4","lightgreen","darkgreen","blue","pink","grey","coral3","darkorchid2","lightsalmon1","mediumpurple4","olivedrab","slateblue","tomato2","burlywood4"),marker = list(size = 5, opacity = 1),text = ~paste('Sample:',samples, '</br> Classifier Group:',GROUPS)) %>% layout(scene = list(xaxis = list(title = "TSNE1"), yaxis = list(title="TSNE2"), zaxis = list(title="TSNE3")))
+
+######### HEATMAPS ########
+pal <- c("red","orange","cyan4","lightgreen","darkgreen","blue","pink","grey","coral3","darkorchid2","lightsalmon1","mediumpurple4","olivedrab","slateblue","tomato2","burlywood4")
+cell_colors = colorRampPalette( c("#010F57", "#010F57", "#FAFAFA", "#B21212", "#B21212") )(300)
+f <- factor(targets$Sample_Group)
+
+png(file=paste(outDir,"/Heatmap(Top 50).png", sep=""),width=3500,height=2800,pointsize=50)
+heatmap.2(gset.funnorm.beta[row.names(dmp[1:50,]),],trace = 'none',key = TRUE,key.title="Methylation",labCol = targets$Sample_Name, cexCol = 0.6, scale = 'row',col = cell_colors,cexRow = 0.52,key.xlab = "BetaValue",main = "Heatmap (Top 50)",ColSideColors = pal[factor(targets$Sample_Group)],key.xtickfun = function() {
+  breaks = c(0,0.2,0.4,0.6,0.8,1)
+  list(at = parent.frame()$scale01(breaks),
+       labels = breaks)
+},keysize = 1,density.info = "none")
+legend("topright", legend=levels(f), col=pal[factor(levels(f))], pch=15,cex = 0.45)
+dev.off()
+
+png(file=paste(outDir,"/Heatmap(Top 100).png", sep=""),width=3500,height=2800,pointsize=50)
+heatmap.2(gset.funnorm.beta[row.names(dmp[1:100,]),],trace = 'none',labCol = targets$Sample_Name, cexCol = 0.6, scale = 'row',col = cell_colors,cexRow = 0.52,key.xlab = "Metylation level (Beta value)",main = "Heatmap (Top 100)",ColSideColors = pal[factor(targets$Sample_Group)],key.xtickfun = function() {
+  breaks = c(0,0.2,0.4,0.6,0.8,1)
+  list(at = parent.frame()$scale01(breaks),
+       labels = breaks)
+},keysize = 1,density.info = "none")
+legend("topright", legend=levels(f), col=pal[factor(levels(f))], pch=15,cex = 0.45)
+dev.off()
+
+png(file=paste(outDir,"/Heatmap(Top 1000).png", sep=""),width=3500,height=2800,pointsize=50)
+heatmap.2(gset.funnorm.beta[row.names(dmp[1:1000,]),],trace = 'none',key.title="Methylation",labRow = FALSE, labCol = targets$Sample_Name, cexCol = 0.6, scale = 'row',col = cell_colors,cexRow = 0.52,key.xlab = "Metylation level (Beta value)",main = "Heatmap (Top 1000)",ColSideColors = pal[factor(targets$Sample_Group)],key.xtickfun = function() {
+  breaks = c(0,0.2,0.4,0.6,0.8,1)
+  list(at = parent.frame()$scale01(breaks),
+       labels = breaks)
+},keysize = 1,density.info = "none")
+legend("topright", legend=levels(f), col=pal[factor(levels(f))], pch=15,cex = 0.45)
+dev.off()
+
+png(file=paste(outDir,"/Heatmap(Top 10000).png", sep=""),width=3500,height=2800,pointsize=50)
+heatmap.2(gset.funnorm.beta[row.names(dmp[1:10000,]),],trace = 'none',key.title="Methylation", labRow = FALSE, labCol = targets$Sample_Name, cexCol = 0.6, scale = 'row',col = cell_colors,cexRow = 0.52,key.xlab = "Metylation level (Beta value)",main = "Heatmap (Top 10000)",ColSideColors = pal[factor(targets$Sample_Group)],key.xtickfun = function() {
+  breaks = c(0,0.2,0.4,0.6,0.8,1)
+  list(at = parent.frame()$scale01(breaks),
+       labels = breaks)
+},keysize = 1,density.info = "none")
+legend("topright", legend=levels(f), col=pal[factor(levels(f))], pch=15,cex = 0.45)
+dev.off()
+
+
+h_top50 <- include_graphics(paste(outDir,"/Heatmap(Top 50).png",sep=""))
+h_top100 <- include_graphics(paste(outDir,"/Heatmap(Top 100).png", sep=""))
+h_top1000 <- include_graphics(paste(outDir,"/Heatmap(Top 1000).png", sep=""))
+h_top10000 <- include_graphics(paste(outDir,"/Heatmap(Top 10000).png", sep=""))
+
+```
+
+# QC
+## Sample Signal Intensity QC
+
+Median methylated vs unmethylated log2 intensity plot checks for the raw signal quality per sample. For each CpG site, methylated and unmethylated measurements are produced and measure of relative methylation levels will ultimately depend on these signal intensities. Samples falling above threshold (MU > 9) are good samples and anything below the threshold are considered bad samples.
+
+```{r, fig.height=8,fig.width=14,warning=FALSE,message=FALSE}
+
+ggplotly(plotMU)
+
+```
+
+## Sample Biological Positive Control QC
+
+Sample biological positive control is assessed based on Non-polymorphic (NP) control probes. NP controls are used to test the overall performance of assay from amplification to detection. Samples falling above threshold (SBPC > 11) are good samples and anything below the threshold are considered bad samples.
+
+```{r, fig.height=8,fig.width=14,warning=FALSE,message=FALSE}
+
+ggplotly(plotOP)
+
+```
+
+## Sample Bisulfite Conversion Control QC
+
+Bisulfite conversion qualtiy is assessed based on Bisulfite Conversion I (BSI) control probes. BSI control probes use Infinium I probe design to montior efficiency of bisulfite conversion. Samples falling above threshold (BS > 10) are good samples and anything below the threshold are considered bad samples.
+
+```{r, fig.height=8,fig.width=14,warning=FALSE,message=FALSE}
+
+ggplotly(plotBS)
+
+```
+
+## Sample Hybridization Control (Technical QC)
+
+Sample hybridization is assessed based on Hybridization control (HC) probes. HC probes test the overall performance of the entire assay using synthetuc targets instead of amplified DNA. Samples falling above threshold (SHC > 12.75) are good samples and anything below the threshold are considered bad samples.
+
+```{r, fig.height=8,fig.width=14,warning=FALSE,message=FALSE}
+
+ggplotly(plotHC)
+
+```
+
+## Sample Negative Control QC
+
+Sample negative control is assessed based on negative control (NC) probes. NC are randomly permuted sequences that should not hybridize to DNA template. The mean signal of these probes defines the background of the system. To be considered good samples less than 95% of probes should be above background signal.
+
+```{r, fig.height=8,fig.width=14,warning=FALSE,message=FALSE}
+
+ggplotly(plotDP)
+
+```
+
+# T-SNE
+
+## tsne-2d
+```{r, fig.height=10,fig.width=14,warning=FALSE,message=FALSE}
+
+p2d_groups
+
+```
+
+## tsne-3d
+```{r, fig.height=10,fig.width=18,warning=FALSE,message=FALSE}
+
+p3d_groups
+
+```
+
+# Heatmaps
+
+## Top 50
+
+```{r, fig.height=10,fig.width=12,warning=FALSE,message=FALSE}
+
+h_top50
+
+```
+
+## Top 100
+
+```{r, fig.height=10,fig.width=12,warning=FALSE,message=FALSE}
+
+h_top100
+
+```
+
+## Top 1000
+
+```{r, fig.height=10,fig.width=12,warning=FALSE,message=FALSE}
+
+h_top1000
+
+```
+
+## Top 10000
+
+```{r, fig.height=10,fig.width=12,warning=FALSE,message=FALSE}
+
+h_top10000
+
+```
