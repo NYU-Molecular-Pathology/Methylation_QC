@@ -259,7 +259,7 @@ dmp_annot_combined <- cbind(annot[row.names(dmp),],dmp)
 final_samples <- row.names((t(gset.funnorm.beta_df[row.names(dmp[1:10000,]),])))
 gset.funnorm.beta_df <- gset.funnorm.beta_df[,colnames(gset.funnorm.beta_df) %in% final_samples]
 ######### TSNE ############
-tsne <- Rtsne(t(gset.funnorm.beta_df[row.names(dmp[1:10000,]),]), dims = 3, perplexity=2, verbose=TRUE, max_iter = 500)
+tsne <- Rtsne(t(gset.funnorm.beta_df[row.names(dmp[1:10000,]),]), dims = 3, perplexity=12, verbose=TRUE, max_iter = 500)
 targets_plot <- targets[targets$Sample_Name %in% colnames(gset.funnorm.beta_df),]
 tsne_plot <- data.frame(x = tsne$Y[,1], y = tsne$Y[,2], z= tsne$Y[,3], samples = targets_plot$Sample_Name, GROUPS = targets_plot$Sample_Group)
 
